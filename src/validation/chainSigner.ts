@@ -106,33 +106,70 @@ async function createFundedSigner(
   }
 }
 
+export const TESTNET_MIRROR_URL = "https://testnet.mirrornode.hedera.com";
+
+export type MirrorAccount = { state: "alive"; tinybars: bigint } | { state: "deleted" };
+
+/**
+ * Account balance and liveliness from the mirror node REST API (`/api/v1/accounts/{id}`).
+ *
+ * Consensus node v0.77 removed the `AccountBalanceQuery` this used to send (testnet
+ * 2026-09-15, mainnet 2026-09-29): the SDK query now ends in BUSY retries. Free, no operator key.
+ * The mirror lags consensus by a few seconds, so a read right after a transfer can show the old
+ * balance. 404 or `deleted: true` = gone; any other non-200 or a body without an integer
+ * `balance.balance` throws — a guessed 0 would trigger a needless top-up.
+ */
+export async function readMirrorAccount(
+  accountId: string,
+  fetchImpl: typeof fetch = fetch,
+  mirrorUrl: string = TESTNET_MIRROR_URL,
+): Promise<MirrorAccount> {
+  if (!HEDERA_ACCOUNT_ID_RE.test(accountId)) {
+    throw new Error(`chainValidation: invalid account id ${JSON.stringify(accountId)} (expected shard.realm.num).`);
+  }
+  const url = `${mirrorUrl.replace(/\/+$/, "")}/api/v1/accounts/${accountId}?transactions=false`;
+  const response = await fetchImpl(url, { signal: AbortSignal.timeout(20_000) });
+  if (response.status === 404) {
+    return { state: "deleted" };
+  }
+  if (!response.ok) {
+    throw new Error(`chainValidation: mirror node returned HTTP ${response.status} for account ${accountId}.`);
+  }
+  const body = JSON.parse(await response.text(), exactBalanceReviver) as {
+    deleted?: unknown;
+    balance?: { balance?: unknown } | null;
+  };
+  if (body.deleted === true) {
+    return { state: "deleted" };
+  }
+  const tinybars = body.balance?.balance;
+  if (typeof tinybars !== "bigint" || tinybars < 0n) {
+    throw new Error(`chainValidation: mirror node returned no balance for account ${accountId}.`);
+  }
+  return { state: "alive", tinybars };
+}
+
+/**
+ * Tinybar balances can exceed 2^53 (the testnet treasury holds ~3.4e18), where `JSON.parse`
+ * silently rounds. Read the digits from the source text where the runtime exposes it (Node 21+);
+ * on older runtimes only a safe integer is accepted, anything larger stays a number and is rejected.
+ */
+function exactBalanceReviver(key: string, value: unknown, context?: { source?: string }): unknown {
+  if (key !== "balance" || typeof value !== "number") return value;
+  const source = context?.source;
+  if (source !== undefined && /^-?\d+$/.test(source)) return BigInt(source);
+  return Number.isSafeInteger(value) ? BigInt(value) : value;
+}
+
 /**
  * Returns whether the persisted signer account still exists on testnet.
  */
 async function checkSignerLiveliness(
   signer: ChainSigner,
-  config: ChainValidationConfig,
+  _config: ChainValidationConfig,
 ): Promise<"alive" | "deleted"> {
-  const sdk = await importHieroSdk();
-  const { accountId: operatorId, privateKey: operatorKey } = await readOperatorCredentials(config);
-  const client = sdk.Client.forTestnet();
-  client.setOperator(sdk.AccountId.fromString(operatorId), operatorKey);
-
-  try {
-    await new sdk.AccountBalanceQuery()
-      .setAccountId(sdk.AccountId.fromString(signer.accountId))
-      .execute(client);
-    return "alive";
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/ACCOUNT_DELETED|INVALID_ACCOUNT_ID|ACCOUNT_ID_DOES_NOT_EXIST/i.test(message)) {
-      return "deleted";
-    }
-    // Unexpected query failure — don't silently recreate; surface it.
-    throw wrapProvisionError(error, operatorId, config);
-  } finally {
-    client.close();
-  }
+  // Unexpected mirror failures throw — don't silently recreate; surface it.
+  return (await readMirrorAccount(signer.accountId)).state;
 }
 
 /**
@@ -150,11 +187,12 @@ async function topUpSignerIfNeeded(
   client.setOperator(sdk.AccountId.fromString(operatorId), operatorKey);
 
   try {
-    const balance = await new sdk.AccountBalanceQuery()
-      .setAccountId(sdk.AccountId.fromString(signer.accountId))
-      .execute(client);
+    const account = await readMirrorAccount(signer.accountId);
+    if (account.state !== "alive") {
+      throw new Error(`chainValidation: signer account ${signer.accountId} is deleted; cannot top it up.`);
+    }
 
-    const currentTinybars = BigInt(balance.hbars.toTinybars().toString());
+    const currentTinybars = account.tinybars;
     const targetTinybars = BigInt(target.toTinybars().toString());
     if (currentTinybars >= targetTinybars) {
       return undefined;
